@@ -4,12 +4,18 @@ Integration tests for edit_note MCP tool.
 Tests the complete edit note workflow: MCP client -> MCP server -> FastAPI -> database
 """
 
+import json
 from pathlib import Path
 
 import pytest
 from fastmcp import Client
 
-from basic_memory.file_utils import parse_frontmatter
+from basic_memory import file_utils
+from basic_memory.file_utils import FileWriteError, parse_frontmatter
+from basic_memory.repository.note_content_repository import (
+    NoteContentRepository,
+    NoteContentVersionConflict,
+)
 
 
 @pytest.mark.asyncio
@@ -379,9 +385,11 @@ async def test_edit_note_error_handling_note_not_found(mcp_server, app, test_pro
                 "content": "replacement",
                 "find_text": "old text",
             },
+            raise_on_error=False,
         )
 
-        # Should return helpful error message
+        # A failed edit is an MCP error result, and its text keeps the guidance
+        assert edit_result.is_error is True
         assert len(edit_result.content) == 1
         error_text = edit_result.content[0].text
         assert "Edit Failed" in error_text
@@ -588,8 +596,11 @@ async def test_edit_note_rejects_blank_metadata_type(mcp_server, app, test_proje
                 "content": "",
                 "metadata": {"type": ""},
             },
+            raise_on_error=False,
         )
 
+        # A failed edit is an MCP error result, and its text keeps the guidance
+        assert edit_result.is_error is True
         assert "Edit Failed" in edit_result.content[0].text
         assert "at least 1 item" in edit_result.content[0].text
         read_result = await client.call_tool(
@@ -626,15 +637,132 @@ async def test_edit_note_error_handling_text_not_found(mcp_server, app, test_pro
                 "content": "replacement text",
                 "find_text": "non-existent text",
             },
+            raise_on_error=False,
         )
 
-        # Should return helpful error message
+        # A failed edit is an MCP error result, and its text keeps the guidance
+        assert edit_result.is_error is True
         assert len(edit_result.content) == 1
         error_text = edit_result.content[0].text
         assert "Edit Failed - Text Not Found" in error_text
         assert "non-existent text" in error_text
         assert "Error Test Note" in error_text
         assert "read_note(" in error_text
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("output_format", ["text", "json"])
+async def test_edit_note_refused_concurrent_write_is_an_error(
+    mcp_server, app, test_project, monkeypatch, output_format
+):
+    """An edit the engine refuses with a 409 must reach the client as an MCP error.
+
+    Two writers racing on one note can make the db_version compare-and-set refuse the
+    second edit. Forcing that conflict deterministically: the refused append changed
+    nothing, so a result that is not is_error would tell the caller it was written.
+    """
+
+    async with Client(mcp_server) as client:
+        created = await client.call_tool(
+            "write_note",
+            {
+                "project": test_project.name,
+                "title": "Refused Edit Note",
+                "directory": "test",
+                "content": "# Refused Edit Note\n\nOriginal body.",
+                "output_format": "json",
+            },
+        )
+        note = json.loads(created.content[0].text)
+        path = Path(test_project.path) / note["file_path"]
+        original = path.read_text(encoding="utf-8")
+
+        async def lose_the_race(self, session, write):
+            raise NoteContentVersionConflict(f"db_version advanced for {write.entity_id}")
+
+        monkeypatch.setattr(NoteContentRepository, "accept_write", lose_the_race)
+
+        edit_result = await client.call_tool(
+            "edit_note",
+            {
+                "project": test_project.name,
+                "identifier": note["permalink"],
+                "operation": "append",
+                "content": "\nThis append was refused.",
+                "output_format": output_format,
+            },
+            raise_on_error=False,
+        )
+
+        assert edit_result.is_error is True
+        text = edit_result.content[0].text
+        assert "modified concurrently" in text
+        if output_format == "json":
+            payload = json.loads(text)
+            assert payload["checksum"] is None
+            assert payload["fileCreated"] is False
+        else:
+            assert "# Edit Failed" in text
+        assert path.read_text(encoding="utf-8") == original
+
+
+@pytest.mark.asyncio
+async def test_edit_note_accepted_write_is_not_reported_as_failed_when_file_write_fails(
+    mcp_server, app, test_project, monkeypatch
+):
+    """An edit the engine accepted is reported as written, even if writing the file fails.
+
+    The accepted content commits before the markdown file is written. On Windows the
+    atomic replace fails when another request holds the file open, and the test
+    runtime writes the file inside the request, so that failure used to come back as
+    an error for an append that was already in the note. A caller that retries an
+    error would then append it twice.
+    """
+
+    async with Client(mcp_server) as client:
+        created = await client.call_tool(
+            "write_note",
+            {
+                "project": test_project.name,
+                "title": "File Write Fails Note",
+                "directory": "test",
+                "content": "# File Write Fails Note\n\nOriginal body.",
+                "output_format": "json",
+            },
+        )
+        note = json.loads(created.content[0].text)
+
+        async def replace_is_refused(path, content):
+            raise FileWriteError(f"Failed to write file {path}: [WinError 5] Access is denied")
+
+        with monkeypatch.context() as patched:
+            patched.setattr(file_utils, "write_file_atomic_bytes", replace_is_refused)
+            edit_result = await client.call_tool(
+                "edit_note",
+                {
+                    "project": test_project.name,
+                    "identifier": note["permalink"],
+                    "operation": "append",
+                    "content": "\nThis append was accepted.",
+                    "output_format": "json",
+                },
+                raise_on_error=False,
+            )
+
+        assert edit_result.is_error is False, edit_result.content[0].text
+        payload = json.loads(edit_result.content[0].text)
+        assert "error" not in payload
+        assert payload["checksum"]
+
+        read_result = await client.call_tool(
+            "read_note",
+            {
+                "project": test_project.name,
+                "identifier": note["permalink"],
+                "output_format": "json",
+            },
+        )
+        assert "This append was accepted." in json.loads(read_result.content[0].text)["content"]
 
 
 @pytest.mark.asyncio
@@ -669,9 +797,11 @@ Final test of the content.""",
                 "find_text": "test",
                 "expected_replacements": 5,
             },
+            raise_on_error=False,
         )
 
-        # Should return helpful error message about count mismatch
+        # A failed edit is an MCP error result, and its text keeps the guidance
+        assert edit_result.is_error is True
         assert len(edit_result.content) == 1
         error_text = edit_result.content[0].text
         assert "Edit Failed - Wrong Replacement Count" in error_text
@@ -965,8 +1095,10 @@ async def test_edit_note_append_autocreate_does_not_fuzzy_match(mcp_server, app,
                 "content": "replaced",
                 "find_text": "Content",
             },
+            raise_on_error=False,
         )
 
+        assert edit_result2.is_error is True
         error_text = edit_result2.content[0].text
         assert "Edit Failed" in error_text
 
